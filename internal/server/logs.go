@@ -19,6 +19,7 @@ func NewLog() *Log {
 	return &Log{}
 }
 
+// nice way to add logs
 func (L *Log) append(R Record) (uint64, error) {
 	L.mu.Lock()
 	defer L.mu.Unlock()
