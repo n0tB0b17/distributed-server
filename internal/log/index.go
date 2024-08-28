@@ -21,7 +21,7 @@ type Index struct {
 	mmap gommap.MMap
 }
 
-func newIndex(f *os.File) (*Index, error) {
+func NewIndex(f *os.File, c Config) (*Index, error) {
 	idx := &Index{
 		file: f,
 	}
@@ -33,7 +33,7 @@ func newIndex(f *os.File) (*Index, error) {
 	}
 
 	idx.size = uint64(fi.Size())
-	err = os.Truncate(f.Name(), int64(1024))
+	err = os.Truncate(f.Name(), int64(c.Segment.MaxIndexBytes))
 	if err != nil {
 		fmt.Println("[INDEX] > Error while truncating file", err.Error())
 		return &Index{}, err
