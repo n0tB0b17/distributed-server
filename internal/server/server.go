@@ -7,6 +7,7 @@ import (
 
 	"github.com/gorilla/mux"
 	log_v1 "github.com/n0tB0b17/distri/api/v1"
+	"google.golang.org/grpc"
 )
 
 type Config struct {
@@ -41,6 +42,17 @@ func newGRPCServer(c *Config) (srv *grpcServer, err error) {
 	return &grpcServer{
 		Config: c,
 	}, nil
+}
+
+func NewGRPCServer(c *Config) (*grpc.Server, error) {
+	grpcServer := grpc.NewServer()
+	srv, err := newGRPCServer(c)
+	if err != nil {
+		return nil, err
+	}
+
+	log_v1.RegisterLogServer(grpcServer, srv)
+	return grpcServer, nil
 }
 
 func (S *grpcServer) Produce(ctx context.Context, in *log_v1.ProduceRequest) (res *log_v1.ProduceResponse, err error) {
@@ -92,8 +104,8 @@ func (S *grpcServer) ConsumeStream(req *log_v1.ConsumeRequest, stream log_v1.Log
 			res, err := S.Consume(stream.Context(), req)
 			switch err.(type) {
 			case nil:
-			// case log_v1.ErrOffsetOutOfRange:
-			// 	continue
+			case log_v1.ErrOffsetOutOfRange:
+				continue
 			default:
 				return err
 			}

@@ -110,7 +110,7 @@ func (L *Log) Read(offset uint64) (*log_v1.Record, error) {
 	}
 
 	if s == nil || s.nextOff <= offset {
-		return nil, fmt.Errorf("offset out of range: %d", offset)
+		return nil, log_v1.ErrOffsetOutOfRange{Offset: offset}
 	}
 
 	return s.Read(offset)
