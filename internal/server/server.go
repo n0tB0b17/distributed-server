@@ -3,15 +3,39 @@ package server
 import (
 	"context"
 	"fmt"
-	"net/http"
+	"strings"
+	"time"
 
-	"github.com/gorilla/mux"
+	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
+	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
+	grpc_zap "github.com/grpc-ecosystem/go-grpc-middleware/logging/zap"
+	grpc_ctxtags "github.com/grpc-ecosystem/go-grpc-middleware/tags"
 	log_v1 "github.com/n0tB0b17/distri/api/v1"
+	"go.opencensus.io/plugin/ocgrpc"
+	"go.opencensus.io/stats/view"
+	"go.opencensus.io/trace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
+)
+
+const (
+	objectWildCard = "*"
+	produceAction  = "produce"
+	consumeAction  = "consume"
 )
 
 type Config struct {
-	log CommitLog
+	log        CommitLog
+	authorizer Authorizer
+}
+
+type Authorizer interface {
+	Authorizer(subject, object, action string) error
 }
 
 type grpcServer struct {
@@ -24,18 +48,6 @@ type CommitLog interface {
 	Read(uint64) (*log_v1.Record, error)
 }
 
-func NewHttpServer(addr string) *http.Server {
-	srv := HttpServer()
-	router := mux.NewRouter()
-
-	router.HandleFunc("/", srv.handleProduce).Methods("POST")
-	router.HandleFunc("/", srv.handleConsume).Methods("GET")
-	return &http.Server{
-		Addr:    addr,
-		Handler: router,
-	}
-}
-
 var _ log_v1.LogServer = (*grpcServer)(nil)
 
 func newGRPCServer(c *Config) (srv *grpcServer, err error) {
@@ -45,6 +57,48 @@ func newGRPCServer(c *Config) (srv *grpcServer, err error) {
 }
 
 func NewGRPCServer(c *Config, opts ...grpc.ServerOption) (*grpc.Server, error) {
+	l := zap.L().Named("server")
+	zapOptions := []grpc_zap.Option{
+		grpc_zap.WithDurationField(
+			func(duration time.Duration) zapcore.Field {
+				return zap.Int64(
+					"grpc.time_ns",
+					duration.Nanoseconds(),
+				)
+			},
+		),
+	}
+
+	sampler := trace.ProbabilitySampler(0.5)
+	trace.ApplyConfig(
+		trace.Config{
+			DefaultSampler: func(p trace.SamplingParameters) trace.SamplingDecision {
+				if strings.Contains(p.Name, "produce") {
+					return trace.SamplingDecision{Sample: true}
+				}
+				return sampler(p)
+			},
+		},
+	)
+
+	err := view.Register(ocgrpc.DefaultServerViews...)
+	if err != nil {
+		return nil, err
+	}
+
+	opts = append(opts, grpc.StreamInterceptor(
+		grpc_middleware.ChainStreamServer(
+			grpc_ctxtags.StreamServerInterceptor(),
+			grpc_zap.StreamServerInterceptor(l, zapOptions...),
+			grpc_auth.StreamServerInterceptor(authenticate),
+		)), grpc.UnaryInterceptor(
+		grpc_middleware.ChainUnaryServer(
+			grpc_ctxtags.UnaryServerInterceptor(),
+			grpc_zap.UnaryServerInterceptor(l, zapOptions...),
+			grpc_auth.UnaryServerInterceptor(authenticate),
+		),
+	), grpc.StatsHandler(&ocgrpc.ServerHandler{}))
+
 	grpcServer := grpc.NewServer(opts...)
 	srv, err := newGRPCServer(c)
 	if err != nil {
@@ -56,6 +110,14 @@ func NewGRPCServer(c *Config, opts ...grpc.ServerOption) (*grpc.Server, error) {
 }
 
 func (S *grpcServer) Produce(ctx context.Context, in *log_v1.ProduceRequest) (res *log_v1.ProduceResponse, err error) {
+	if err := S.authorizer.Authorizer(
+		subject(ctx),
+		objectWildCard,
+		produceAction,
+	); err != nil {
+		return nil, err
+	}
+
 	off, err := S.log.Append(in.Record)
 	if err != nil {
 		fmt.Println("[GRPCSERVER | PRODUCE] > Error while running Produce function of GRPC service", err.Error())
@@ -65,6 +127,13 @@ func (S *grpcServer) Produce(ctx context.Context, in *log_v1.ProduceRequest) (re
 }
 
 func (S *grpcServer) Consume(ctx context.Context, in *log_v1.ConsumeRequest) (*log_v1.ConsumeResponse, error) {
+	if err := S.authorizer.Authorizer(
+		subject(ctx),
+		objectWildCard,
+		consumeAction,
+	); err != nil {
+		return nil, err
+	}
 	record, err := S.log.Read(in.Offset)
 	if err != nil {
 		fmt.Println("[GRPCSERVER | CONSUME] > Error while running Consume function of GRPC service", err.Error())
@@ -115,4 +184,30 @@ func (S *grpcServer) ConsumeStream(req *log_v1.ConsumeRequest, stream log_v1.Log
 			req.Offset++
 		}
 	}
+}
+
+func subject(ctx context.Context) string {
+	return ctx.Value(subjectContextKey{}).(string)
+}
+
+type subjectContextKey struct{}
+
+func authenticate(ctx context.Context) (context.Context, error) {
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return ctx, status.New(
+			codes.Unknown,
+			"couldnt find peer information",
+		).Err()
+	}
+
+	if p.AuthInfo == nil {
+		return context.WithValue(ctx, subjectContextKey{}, ""), nil
+	}
+
+	tlsInfo := p.AuthInfo.(credentials.TLSInfo)
+	subject := tlsInfo.State.VerifiedChains[0][0].Subject.CommonName
+	ctx = context.WithValue(ctx, subjectContextKey{}, subject)
+
+	return ctx, nil
 }
