@@ -19,7 +19,7 @@ func New(model, policy string) *Authorizer {
 	}
 }
 
-func (A *Authorizer) Authorize(subject, object, action string) error {
+func (A *Authorizer) Authorizer(subject, object, action string) error {
 	resp := A.enforcer.Enforce(subject, action, object)
 	if !resp {
 		msg := fmt.Sprintf(

@@ -30,8 +30,8 @@ const (
 )
 
 type Config struct {
-	log        CommitLog
-	authorizer Authorizer
+	CommitLog  CommitLog
+	Authorizer Authorizer
 }
 
 type Authorizer interface {
@@ -110,7 +110,7 @@ func NewGRPCServer(c *Config, opts ...grpc.ServerOption) (*grpc.Server, error) {
 }
 
 func (S *grpcServer) Produce(ctx context.Context, in *log_v1.ProduceRequest) (res *log_v1.ProduceResponse, err error) {
-	if err := S.authorizer.Authorizer(
+	if err := S.Authorizer.Authorizer(
 		subject(ctx),
 		objectWildCard,
 		produceAction,
@@ -118,7 +118,7 @@ func (S *grpcServer) Produce(ctx context.Context, in *log_v1.ProduceRequest) (re
 		return nil, err
 	}
 
-	off, err := S.log.Append(in.Record)
+	off, err := S.CommitLog.Append(in.Record)
 	if err != nil {
 		fmt.Println("[GRPCSERVER | PRODUCE] > Error while running Produce function of GRPC service", err.Error())
 		return nil, err
@@ -127,14 +127,14 @@ func (S *grpcServer) Produce(ctx context.Context, in *log_v1.ProduceRequest) (re
 }
 
 func (S *grpcServer) Consume(ctx context.Context, in *log_v1.ConsumeRequest) (*log_v1.ConsumeResponse, error) {
-	if err := S.authorizer.Authorizer(
+	if err := S.Authorizer.Authorizer(
 		subject(ctx),
 		objectWildCard,
 		consumeAction,
 	); err != nil {
 		return nil, err
 	}
-	record, err := S.log.Read(in.Offset)
+	record, err := S.CommitLog.Read(in.Offset)
 	if err != nil {
 		fmt.Println("[GRPCSERVER | CONSUME] > Error while running Consume function of GRPC service", err.Error())
 		return nil, err

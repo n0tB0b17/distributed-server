@@ -27,6 +27,20 @@ type Membership struct {
 	logger  *zap.Logger
 }
 
+func New(hdlr Handler, cfg Config) (*Membership, error) {
+	membership := &Membership{
+		Config:  cfg,
+		handler: hdlr,
+		logger:  zap.L().Named("membership"),
+	}
+
+	if err := membership.setupSerf(); err != nil {
+		return nil, err
+	}
+
+	return membership, nil
+}
+
 func (M *Membership) setupSerf() error {
 	addr, err := net.ResolveTCPAddr("tcp", M.BindAddr)
 	if err != nil {
