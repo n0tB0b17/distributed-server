@@ -71,6 +71,25 @@ func (R *Replicator) replicate(addr string, leave chan struct{}) {
 	}
 }
 
+func (R *Replicator) Join(name string, addr string) error {
+	R.mu.Lock()
+	defer R.mu.Unlock()
+	R.init()
+
+	if R.closed {
+		return nil
+	}
+
+	if _, ok := R.servers[name]; ok {
+		return nil
+	}
+
+	R.servers[name] = make(chan struct{})
+	go R.replicate(addr, R.servers[name])
+
+	return nil
+}
+
 func (R *Replicator) Leave(name string) error {
 	R.mu.Lock()
 	defer R.mu.Unlock()
