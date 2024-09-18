@@ -164,7 +164,7 @@ func (A *Agent) setupMembership() error {
 		StartJoinAddr: A.StartJoinsAddr,
 	}
 	A.membership, err = discovery.New(
-		nil,
+		A.replicator,
 		discfg,
 	)
 
