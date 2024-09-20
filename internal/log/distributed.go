@@ -1,10 +1,13 @@
 package log
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/hashicorp/raft"
 	log_v1 "github.com/n0tB0b17/distri/api/v1"
@@ -52,13 +55,14 @@ func (DL *DistributedLog) setupRaft(datadir string) error {
 	return nil
 }
 
+// function implementation for raft.FSM
+// fsm stands for > finite-state-machine
 type fms struct {
 	log *Log
 }
 
 var _ raft.FSM = (*fms)(nil)
 
-// function implementation for raft.FMS
 type RequestType uint8
 
 const AppendRequestType RequestType = 0
@@ -89,6 +93,7 @@ func (l *fms) applyAppend(b []byte) interface{} {
 	return &log_v1.ProduceResponse{Offset: offset}
 }
 
+// log repliacation and persistence
 var _ raft.FSMSnapshot = (*snapshot)(nil)
 
 type snapshot struct {
@@ -114,11 +119,12 @@ func (f *fms) Restore(r io.ReadCloser) error {
 	return nil
 }
 
-var _ raft.LogStore = (*logStore)(nil)
-
 type logStore struct {
 	*Log
 }
+
+// storing our custom logs to raft store
+var _ raft.LogStore = (*logStore)(nil)
 
 func NewLogStore(dir string, cfg Config) (*logStore, error) {
 	log, err := NewLog(dir, cfg)
@@ -166,4 +172,62 @@ func (L *logStore) StoreLogs(records []*raft.Log) error {
 }
 func (L *logStore) DeleteRange(max, min uint64) error {
 	return L.Truncate(max)
+}
+
+// type StreamLayer interface{
+// 	net.Listener
+// 	Dial(addr raft.ServerAddress, timeout time.Duration) (net.Conn, error)
+// }
+
+// stream layer
+// tls for encryped connection
+type StreamLayer struct {
+	listener        net.Listener
+	serverTLSConfig *tls.Config
+	peerTLSConfig   *tls.Config
+}
+
+var _ raft.StreamLayer = (*StreamLayer)(nil)
+
+const RaftRPC = 1
+
+func NewStreamLayer(
+	listener net.Listener,
+	serverTLSConfig,
+	peerTLSConfig *tls.Config,
+) *StreamLayer {
+	return &StreamLayer{
+		listener:        listener,
+		serverTLSConfig: serverTLSConfig,
+		peerTLSConfig:   peerTLSConfig,
+	}
+}
+
+// makes a outgoing connection to server in a raft cluster.
+func (S *StreamLayer) Dial(
+	addr raft.ServerAddress,
+	timeout time.Duration,
+) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.Dial("tcp", string(addr))
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = conn.Write([]byte{byte(RaftRPC)})
+	if err != nil {
+		return nil, err
+	}
+
+	if S.peerTLSConfig != nil {
+		conn = tls.Client(conn, S.peerTLSConfig)
+	}
+
+	return conn, nil
+}
+
+func (S *StreamLayer) Close() error   { return S.listener.Close() }
+func (S *StreamLayer) Addr() net.Addr { return S.listener.Addr() }
+func (S *StreamLayer) Accept() (net.Conn, error) {
+	return nil, nil
 }
