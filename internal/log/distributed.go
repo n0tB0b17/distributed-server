@@ -113,3 +113,57 @@ func (f *fms) Snapshot() (raft.FSMSnapshot, error) {
 func (f *fms) Restore(r io.ReadCloser) error {
 	return nil
 }
+
+var _ raft.LogStore = (*logStore)(nil)
+
+type logStore struct {
+	*Log
+}
+
+func NewLogStore(dir string, cfg Config) (*logStore, error) {
+	log, err := NewLog(dir, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	return &logStore{log}, nil
+}
+
+func (L *logStore) FirstIndex() (uint64, error) {
+	return L.LowestOffset()
+}
+func (L *logStore) LastIndex() (uint64, error) {
+	return L.HighestOffset()
+}
+func (L *logStore) GetLog(index uint64, out *raft.Log) error {
+	record, err := L.Read(index)
+	if err != nil {
+		return err
+	}
+
+	out.Index = record.Offset
+	out.Data = record.Value
+	out.Type = raft.LogType(record.Type)
+	out.Term = record.Term
+	return nil
+}
+
+func (L *logStore) StoreLog(record *raft.Log) error {
+	return L.StoreLogs([]*raft.Log{record})
+}
+
+func (L *logStore) StoreLogs(records []*raft.Log) error {
+	for _, record := range records {
+		if _, err := L.Append(&log_v1.Record{
+			Value: record.Data,
+			Term:  record.Term,
+			Type:  uint32(record.Type),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (L *logStore) DeleteRange(max, min uint64) error {
+	return L.Truncate(max)
+}
