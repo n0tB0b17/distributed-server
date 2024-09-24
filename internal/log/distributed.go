@@ -1,6 +1,7 @@
 package log
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb"
 	log_v1 "github.com/n0tB0b17/distri/api/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -17,7 +19,7 @@ import (
 type DistributedLog struct {
 	config Config
 	log    *Log
-	raft   raft.Raft
+	raft   *raft.Raft
 }
 
 func NewDistributedLog(datadir string, cfg Config) (*DistributedLog, error) {
@@ -48,11 +50,152 @@ func (DL *DistributedLog) setupLog(datadir string) error {
 }
 
 func (DL *DistributedLog) setupRaft(datadir string) error {
-	fms := &fms{
-		log: DL.log,
+	fms := &fms{log: DL.log}
+	logPath := filepath.Join(datadir, "raft", "log")
+	if err := os.MkdirAll(logPath, 0755); err != nil {
+		return err
 	}
-	fmt.Println(fms)
-	return nil
+
+	logConfig := DL.config
+	logConfig.Segment.InitialOffset = 1
+	logStore, err := NewLogStore(logPath, logConfig)
+	if err != nil {
+		return err
+	}
+
+	stableStore, err := raftboltdb.NewBoltStore(filepath.Join(datadir, "raft", "stable"))
+	if err != nil {
+		return err
+	}
+
+	snapshotStore, err := raft.NewFileSnapshotStore(
+		filepath.Join(datadir, "raft"),
+		1,
+		os.Stderr,
+	)
+	if err != nil {
+		return err
+	}
+
+	transport := raft.NewNetworkTransport(
+		nil,
+		5,
+		10*time.Second,
+		os.Stderr,
+	)
+
+	cfg := raft.DefaultConfig()
+	cfg.LocalID = DL.config.Raft.LocalID
+	if DL.config.Raft.HeartbeatTimeout != 0 {
+		cfg.HeartbeatTimeout = DL.config.Raft.HeartbeatTimeout
+	}
+
+	if DL.config.Raft.ElectionTimeout != 0 {
+		cfg.ElectionTimeout = DL.config.Raft.ElectionTimeout
+	}
+
+	if DL.config.Raft.LeaderLeaseTimeout != 0 {
+		cfg.LeaderLeaseTimeout = DL.config.Raft.LeaderLeaseTimeout
+	}
+
+	if DL.config.Raft.CommitTimeout != 0 {
+		cfg.CommitTimeout = DL.config.Raft.CommitTimeout
+	}
+
+	DL.raft, err = raft.NewRaft(
+		cfg,
+		fms,
+		logStore,
+		stableStore,
+		snapshotStore,
+		transport,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	hasExisted, err := raft.HasExistingState(
+		logStore,
+		stableStore,
+		snapshotStore,
+	)
+
+	if err != nil {
+		return err
+	}
+
+	if DL.config.Raft.Bootstrap && !hasExisted {
+		raftServer := []raft.Server{{
+			ID:      cfg.LocalID,
+			Address: transport.LocalAddr(),
+		}}
+		raftConfig := raft.Configuration{
+			Servers: raftServer,
+		}
+
+		err = DL.raft.BootstrapCluster(raftConfig).Error()
+	}
+	return err
+}
+
+func (DL *DistributedLog) Append(record *log_v1.Record) (uint64, error) {
+	resp, err := DL.apply(AppendRequestType, &log_v1.ProduceRequest{Record: record})
+	if err != nil {
+		return 0, err
+	}
+
+	return resp.(*log_v1.ProduceResponse).Offset, nil
+}
+
+func (DL *DistributedLog) apply(reqType RequestType, protoMsg proto.Message) (interface{}, error) {
+	var buf bytes.Buffer
+	_, err := buf.Write([]byte{byte(reqType)})
+	if err != nil {
+		return nil, err
+	}
+
+	b, err := proto.Marshal(protoMsg)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = buf.Write(b)
+	if err != nil {
+		return nil, err
+	}
+
+	timeout := 10 * time.Second
+	applyFuture := DL.raft.Apply(buf.Bytes(), timeout)
+	if applyFuture.Error() != nil {
+		return nil, applyFuture.Error()
+	}
+
+	resp := applyFuture.Response()
+	if err := resp.(error); err != nil {
+		return nil, err
+	}
+
+	return resp, nil
+}
+
+func (DL *DistributedLog) Read(offset uint64) (*log_v1.Record, error) { return DL.log.Read(offset) }
+func (DL *DistributedLog) Join(id, addr string) error                 { return nil }
+
+func (DL *DistributedLog) Leave(id string) error {
+	removeFuture := DL.raft.RemoveServer(raft.ServerID(id), 0, 0)
+	return removeFuture.Error()
+}
+
+func (DL *DistributedLog) WaitForLeader(dur time.Duration) error { return nil }
+
+func (DL *DistributedLog) Close() error {
+	f := DL.raft.Shutdown()
+	if err := f.Error(); err != nil {
+		return err
+	}
+
+	return DL.log.Close()
 }
 
 // function implementation for raft.FSM
@@ -189,6 +332,7 @@ type StreamLayer struct {
 
 var _ raft.StreamLayer = (*StreamLayer)(nil)
 
+// for multiplex raft on same port
 const RaftRPC = 1
 
 func NewStreamLayer(
@@ -229,5 +373,24 @@ func (S *StreamLayer) Dial(
 func (S *StreamLayer) Close() error   { return S.listener.Close() }
 func (S *StreamLayer) Addr() net.Addr { return S.listener.Addr() }
 func (S *StreamLayer) Accept() (net.Conn, error) {
-	return nil, nil
+	conn, err := S.listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	bt := make([]byte, 1)
+	_, err = conn.Write(bt)
+	if err != nil {
+		return nil, err
+	}
+
+	if comp := bytes.Compare([]byte{byte(RaftRPC)}, bt); comp != 0 {
+		return nil, fmt.Errorf("Not a Raft RPC")
+	}
+
+	if S.serverTLSConfig != nil {
+		return tls.Server(conn, S.serverTLSConfig), nil
+	}
+
+	return conn, nil
 }
