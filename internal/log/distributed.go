@@ -3,6 +3,7 @@ package log
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -204,6 +205,8 @@ type fms struct {
 	log *Log
 }
 
+// should implement following functions
+// 1.Apply | 2.Snapshot | 3.Restore
 var _ raft.FSM = (*fms)(nil)
 
 type RequestType uint8
@@ -236,6 +239,36 @@ func (l *fms) applyAppend(b []byte) interface{} {
 	return &log_v1.ProduceResponse{Offset: offset}
 }
 
+func (f *fms) Snapshot() (raft.FSMSnapshot, error) {
+	r := f.log.Reader()
+	return &snapshot{reader: r}, nil
+}
+
+func (f *fms) Restore(r io.ReadCloser) error {
+	b := make([]byte, lenWidth)
+	var buf bytes.Buffer
+	for i := 0; ; i++ {
+		_, err := io.ReadFull(r, b)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+
+		size := int64(binary.LittleEndian.Uint64(b))
+		if _, err := io.CopyN(&buf, r, size); err != nil {
+			return err
+		}
+
+		record := &log_v1.Record{}
+		fmt.Println(record)
+
+	}
+	return nil
+}
+
+// end of FMS
+
 // log repliacation and persistence
 var _ raft.FSMSnapshot = (*snapshot)(nil)
 
@@ -251,15 +284,6 @@ func (s *snapshot) Persist(sink raft.SnapshotSink) error {
 	}
 
 	return sink.Close()
-}
-
-func (f *fms) Snapshot() (raft.FSMSnapshot, error) {
-	r := f.log.Reader()
-	return &snapshot{reader: r}, nil
-}
-
-func (f *fms) Restore(r io.ReadCloser) error {
-	return nil
 }
 
 type logStore struct {
