@@ -59,7 +59,7 @@ func (DL *DistributedLog) setupRaft(datadir string) error {
 
 	logConfig := DL.config
 	logConfig.Segment.InitialOffset = 1
-	logStore, err := NewLogStore(logPath, logConfig)
+	logStore, err := newLogStore(logPath, logConfig)
 	if err != nil {
 		return err
 	}
@@ -181,14 +181,57 @@ func (DL *DistributedLog) apply(reqType RequestType, protoMsg proto.Message) (in
 }
 
 func (DL *DistributedLog) Read(offset uint64) (*log_v1.Record, error) { return DL.log.Read(offset) }
-func (DL *DistributedLog) Join(id, addr string) error                 { return nil }
+func (DL *DistributedLog) Join(id, addr string) error {
+	raftCfg := DL.raft.GetConfiguration()
+	if err := raftCfg.Error(); err != nil {
+		return err
+	}
+
+	raftID := raft.ServerID(id)
+	raftServer := raft.ServerAddress(addr)
+
+	for _, srv := range raftCfg.Configuration().Servers {
+		if srv.ID == raftID || srv.Address == raftServer {
+			if srv.ID == raftID && srv.Address == raftServer {
+				// server already joined
+				return nil
+			}
+			// remove existing server
+			raftDel := DL.raft.RemoveServer(raftID, 0, 0)
+			if err := raftDel.Error(); err != nil {
+				return err
+			}
+		}
+	}
+
+	raftAdd := DL.raft.AddVoter(raftID, raftServer, 0, 0)
+	if err := raftAdd.Error(); err != nil {
+		return err
+	}
+
+	return nil
+}
 
 func (DL *DistributedLog) Leave(id string) error {
 	removeFuture := DL.raft.RemoveServer(raft.ServerID(id), 0, 0)
 	return removeFuture.Error()
 }
 
-func (DL *DistributedLog) WaitForLeader(dur time.Duration) error { return nil }
+func (DL *DistributedLog) WaitForLeader(dur time.Duration) error {
+	timeoutAfter := time.After(dur)
+	tTicker := time.NewTicker(time.Second)
+	defer tTicker.Stop()
+	for {
+		select {
+		case <-timeoutAfter:
+			return fmt.Errorf("timeout error")
+		case <-tTicker.C:
+			if l := DL.raft.Leader(); l != "" {
+				return nil
+			}
+		}
+	}
+}
 
 func (DL *DistributedLog) Close() error {
 	f := DL.raft.Shutdown()
@@ -261,8 +304,22 @@ func (f *fms) Restore(r io.ReadCloser) error {
 		}
 
 		record := &log_v1.Record{}
-		fmt.Println(record)
+		if err := proto.Unmarshal(buf.Bytes(), record); err != nil {
+			return err
+		}
 
+		if i == 0 {
+			f.log.config.Segment.InitialOffset = record.Offset
+			if err := f.log.Reset(); err != nil {
+				return err
+			}
+		}
+
+		if _, err := f.log.Append(record); err != nil {
+			return err
+		}
+
+		buf.Reset()
 	}
 	return nil
 }
@@ -293,7 +350,7 @@ type logStore struct {
 // storing our custom logs to raft store
 var _ raft.LogStore = (*logStore)(nil)
 
-func NewLogStore(dir string, cfg Config) (*logStore, error) {
+func newLogStore(dir string, cfg Config) (*logStore, error) {
 	log, err := NewLog(dir, cfg)
 	if err != nil {
 		return nil, err
